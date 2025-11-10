@@ -196,7 +196,7 @@ def preprocess_image_for_ocr(image):
         return image
 
 
-# --- ##### NEW FIX (Fix 8): FINAL ROBUST BANK STATEMENT PARSER ##### ---
+# --- ##### FINAL ROBUST BANK STATEMENT PARSER (Fix 8 Logic) ##### ---
 def parse_bank_statement_pdf(uploaded_file):
     """
     Extract transactions from bank statement PDF, chunk by chunk for better accuracy.
@@ -264,7 +264,7 @@ def parse_bank_statement_pdf(uploaded_file):
         st.error("Could not extract any text chunks from the PDF.")
         return []
         
-    # --- Step 4: AI Extraction ---
+    # --- Step 4: AI Extraction (Python handles logic) ---
     agent = Agent(
         name="Statement Parser",
         model=Ollama(id=OLLAMA_PARSING_MODEL),
@@ -277,8 +277,7 @@ def parse_bank_statement_pdf(uploaded_file):
         chunk_text = chunk_doc.page_content
         page_num = chunk_doc.metadata.get('page', 'N/A')
         
-        # --- ##### THIS IS THE NEW, SIMPLIFIED PROMPT (Fix 8) ##### ---
-        # This prompt moves the logic from the AI to Python.
+        # --- This prompt moves the Debit/Credit logic to Python ---
         extraction_prompt = f"""
 You are a meticulous data-entry AI. You only extract; you NEVER invent or hallucinate data.
 
@@ -331,7 +330,6 @@ Output JSON:
 **Bank Statement Text Chunk (Page {page_num}, Chunk {i+1}/{len(all_chunks)}):**
 {chunk_text}
 """
-        # --- ##### END OF NEW PROMPT ##### ---
         
         try:
             response = agent.run(extraction_prompt).content
@@ -956,6 +954,89 @@ def retrieve_documents(prompt, vector_store_client, COLLECTION_NAME):
         return [], False
 
 
+# --- ##### NEW (Fix 11): "GATEKEEPER" FUNCTIONS ##### ---
+def is_finance_question(prompt):
+    """Detects if the user is asking about their financial data."""
+    prompt_lower = prompt.lower()
+    finance_keywords = [
+        "finance", "financial", "tracker", "how much did i spend", 
+        "what are my expenses", "earnings", "spending", "total cost",
+        "budget", "bank", "transactions", "how much", "summary of my finances"
+    ]
+    if any(keyword in prompt_lower for keyword in finance_keywords):
+        return True
+    return False
+
+def is_document_question(prompt):
+    """
+    Determine if the question is likely about uploaded documents.
+    This is a simple check to avoid distracting the AI with RAG.
+    """
+    prompt_lower = prompt.lower()
+    
+    # Keywords that strongly indicate a document question
+    doc_keywords = [
+        "document", "pdf", "file", "uploaded", "according to", 
+        "in the document", "what does the doc", "summarize the", "in the file",
+        "what does this pdf", "search the doc"
+    ]
+    if any(keyword in prompt_lower for keyword in doc_keywords):
+        return True
+    
+    # Keywords that strongly indicate casual chat, memory, OR finance
+    # This prevents RAG from running on these topics
+    casual_or_finance_keywords = [
+        "hello", "hi", "hey", "how are you", "my name is", "i am", "i'm",
+        "what's up", "good morning", "what did i say", "what did we talk about", 
+        "do you remember", "what colour was my", "what was my", "my ice cream is",
+        "finance", "financial", "tracker", "how much did i spend", 
+        "what are my expenses", "earnings", "spending", "how much"
+    ]
+    if any(keyword in prompt_lower for keyword in casual_or_finance_keywords):
+        return False
+    
+    # If documents exist and it's not clearly casual/finance, assume it's a doc question.
+    if st.session_state.rag_enabled and st.session_state.processed_documents:
+        return True
+        
+    # Default to False (it's chat) if no documents are uploaded.
+    return False
+
+def build_finance_context():
+    """Loads expense/earning data and formats it as context."""
+    try:
+        expenses = load_expenses()
+        earnings = load_earnings()
+        
+        if not expenses and not earnings:
+            return "\n\n--- Financial Tracker Summary ---\nThe tracker is currently empty.\n--- End of Financial Summary ---\n"
+        
+        context = "\n\n--- Financial Tracker Summary ---\n"
+        
+        total_expense = sum(e.get('amount', 0) for e in expenses)
+        total_earning = sum(e.get('amount', 0) for e in earnings)
+        context += f"Total Expenses: ${total_expense:.2f} ({len(expenses)} transactions)\n"
+        context += f"Total Earnings: ${total_earning:.2f} ({len(earnings)} transactions)\n"
+        context += f"Net Cashflow: ${total_earning - total_expense:.2f}\n"
+
+        if expenses:
+            context += "\n**Recent Expenses (Last 5):**\n"
+            for ex in expenses[-5:]:
+                context += f"- {ex.get('date', 'N/A')}: {ex.get('description', 'N/A')} (${ex.get('amount', 0):.2f})\n"
+        
+        if earnings:
+            context += "\n**Recent Earnings (Last 5):**\n"
+            for ea in earnings[-5:]:
+                context += f"- {ea.get('date', 'N/A')}: {ea.get('description', 'N/A')} (${ea.get('amount', 0):.2f})\n"
+        
+        context += "--- End of Financial Summary ---\n"
+        return context
+    except Exception as e:
+        st.warning(f"Error loading finance context: {e}")
+        return "\n\n--- Financial Tracker Summary ---\nError loading data.\n--- End of Financial Summary ---\n"
+# --- ##### END NEW FUNCTIONS ##### ---
+
+
 # --- ##### FULLY RESTORED EXPENSE TRACKER UI ##### ---
 if st.session_state.show_expense_tracker:
     
@@ -1485,32 +1566,63 @@ if not st.session_state.show_expense_tracker:
         user_info_context = build_user_info_context()
         
         document_context = ""
-        if st.session_state.rag_enabled and chroma_client:
+        finance_context = "" # <-- NEW
+
+        # --- ##### THIS IS THE NEW LOGIC FIX (Fix 11) ##### ---
+        # We now have a 3-way decision
+        
+        is_finance = is_finance_question(prompt)
+        is_doc = is_document_question(prompt) # This will be False if is_finance is True
+
+        if is_finance:
+            with st.spinner("Accessing financial tracker..."):
+                finance_context = build_finance_context()
+        
+        elif is_doc and st.session_state.rag_enabled and chroma_client:
             with st.spinner("Searching documents..."):
                 docs, has_docs = retrieve_documents(prompt, chroma_client, COLLECTION_NAME)
                 if has_docs:
                     document_context = "\n\nRelevant documents:\n" + "\n\n".join(docs) + "\n"
+        # --- ##### END NEW LOGIC FIX ##### ---
 
         with st.spinner("Thinking..."):
             agent = get_conversational_agent()
             
-            if document_context:
+            # --- ##### NEW PROMPT LOGIC (Fix 11) ##### ---
+            if finance_context:
+                # 1. Finance Prompt
+                full_prompt = f"""{user_info_context}
+{conversation_context}
+{finance_context}
+
+**Current question: {prompt}**
+
+**Instruction:** Answer the user's question using the "Financial Tracker Summary".
+You MUST use the data from the summary to answer.
+If the summary is empty, just say "The financial tracker is currently empty."
+"""
+            elif document_context:
+                # 2. RAG Prompt
                 full_prompt = f"""{user_info_context}
 {conversation_context}
 {document_context}
 
 **Current question: {prompt}**
 
-**Instruction:** Answer the user's question. You **MUST** use the 'Relevant documents' context provided above. Answer based *only* on this context. If the answer is not in the context, state that clearly.
+**Instruction:** Answer the user's question using **only** the "Relevant documents" section.
+If the answer is not in the documents, state clearly that the documents do not contain that information.
 """
             else:
+                # 3. Chat/Memory Prompt
                 full_prompt = f"""{user_info_context}
 {conversation_context}
 
 **Current question: {prompt}**
 
-**Instruction:** Answer directly and concisely. Remember to check the conversation history and stored facts above.
+**Instruction:** Answer the user's question using **only** the "Full conversation history" and "IMPORTANT" facts.
+If the answer is not in the history or facts, state that you do not have that information.
 """
+            # --- ##### END PROMPT FIX ##### ---
             
             try:
                 response = agent.run(full_prompt).content
